@@ -6021,6 +6021,11 @@ static bool ImFontRtlIsArabicCodepoint( unsigned int c )
 
 bool ImFontRtlTextNeedsShape( const char* text_begin, const char* text_end )
 {
+	// [RTL] While the password font is active we render a masking glyph ('*')
+	// for every character, so we must not run Arabic shaping (which would fetch
+	// the real glyphs from the font and defeat the masking).
+	if( GImGui != NULL && GImGui->InputTextPasswordFontActive )
+		return false;
 	const char* s = text_begin;
 	while( s < text_end )
 	{

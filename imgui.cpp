@@ -4352,6 +4352,7 @@ ImGuiContext::ImGuiContext(ImFontAtlas* shared_font_atlas)
     MouseStationaryTimer = 0.0f;
 
     InputTextPasswordFontBackupFlags = ImFontFlags_None;
+    InputTextPasswordFontActive = false;
     InputTextReactivateId = 0;
     TempInputId = 0;
     memset(&DataTypeZeroValue, 0, sizeof(DataTypeZeroValue));
@@ -11570,11 +11571,16 @@ void ImGui::ItemSize(const ImVec2& size, float text_baseline_y)
 
     // Always align ourselves on pixel boundaries
     //if (g.IO.KeyAlt) window->DrawList->AddRect(window->DC.CursorPos, window->DC.CursorPos + ImVec2(size.x, line_height), IM_COL32(255,0,0,200)); // [DEBUG]
-    window->DC.CursorPosPrevLine.x = window->DC.CursorPos.x + size.x;
+    // [RTL] In right-to-left layout, horizontal flow runs leftward: store the item's
+    // LEFT edge as the "previous line" X so that SameLine() can advance to the left,
+    // while still growing the content extent using the item's right edge.
+    const bool rtl_layout = (g.IO.ConfigFlags & ImGuiConfigFlags_RightToLeft) != 0;
+    const float item_right_x = window->DC.CursorPos.x + size.x;
+    window->DC.CursorPosPrevLine.x = rtl_layout ? window->DC.CursorPos.x : item_right_x;
     window->DC.CursorPosPrevLine.y = line_y1;
     window->DC.CursorPos.x = IM_TRUNC(window->Pos.x + window->DC.Indent.x + window->DC.ColumnsOffset.x);    // Next line
     window->DC.CursorPos.y = IM_TRUNC(line_y1 + line_height + g.Style.ItemSpacing.y);                       // Next line
-    window->DC.CursorMaxPos.x = ImMax(window->DC.CursorMaxPos.x, window->DC.CursorPosPrevLine.x);
+    window->DC.CursorMaxPos.x = ImMax(window->DC.CursorMaxPos.x, item_right_x);
     window->DC.CursorMaxPos.y = ImMax(window->DC.CursorMaxPos.y, window->DC.CursorPos.y - g.Style.ItemSpacing.y);
     //if (g.IO.KeyAlt) window->DrawList->AddCircle(window->DC.CursorMaxPos, 3.0f, IM_COL32(255,0,0,255), 4); // [DEBUG]
 
@@ -11613,7 +11619,11 @@ void ImGui::SameLine(float offset_from_start_x, float spacing_w)
     {
         if (spacing_w < 0.0f)
             spacing_w = g.Style.ItemSpacing.x;
-        window->DC.CursorPos.x = window->DC.CursorPosPrevLine.x + spacing_w;
+        // [RTL] Horizontal flow runs leftward: CursorPosPrevLine.x holds the previous
+        // item's left edge, so we move further left by the spacing amount.
+        const bool rtl_layout = (g.IO.ConfigFlags & ImGuiConfigFlags_RightToLeft) != 0;
+        window->DC.CursorPos.x = rtl_layout ? (window->DC.CursorPosPrevLine.x - spacing_w)
+                                            : (window->DC.CursorPosPrevLine.x + spacing_w);
         window->DC.CursorPos.y = window->DC.CursorPosPrevLine.y;
     }
     window->DC.CurrLineSize = window->DC.PrevLineSize;

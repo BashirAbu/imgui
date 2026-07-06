@@ -2468,6 +2468,8 @@ struct IMGUI_API ImGuiInputTextState
 	int   LineCount; // last line count (solely for debugging)
 	float WrapWidth; // word-wrapping width
 	float
+	    RtlAlignWidth; // [RTL] when > 0, right-align each line's display within this width (password/multiline in RTL layout). 0 = disabled.
+	float
 	    CursorAnim; // timer for cursor blink, reset on every user action so the cursor reappears immediately
 	bool
 	    CursorFollow; // set when we want scrolling to follow the current cursor position (not always!)
@@ -2537,7 +2539,7 @@ enum ImGuiWindowRefreshFlags_
 	    1 << 1, // [EXPERIMENTAL] Always refresh on hover
 	ImGuiWindowRefreshFlags_RefreshOnFocus =
 	    1 << 2, // [EXPERIMENTAL] Always refresh on focus
-	// Refresh policy/frequency, Load Balancing etc.
+	            // Refresh policy/frequency, Load Balancing etc.
 };
 
 enum ImGuiWindowBgClickFlags_
@@ -4321,6 +4323,8 @@ struct ImGuiContext
 	ImGuiInputTextDeactivatedState InputTextDeactivatedState;
 	ImFontBaked                    InputTextPasswordFontBackupBaked;
 	ImFontFlags                    InputTextPasswordFontBackupFlags;
+	bool
+	    InputTextPasswordFontActive; // [RTL] When true, disable Arabic shaping so the '*' masking glyph is used.
 	ImGuiID
 	    InputTextReactivateId; // ID of InputText to reactivate on next frame (for io.ConfigInputTextEnterKeepActive behavior)
 	ImGuiID
@@ -6135,20 +6139,20 @@ TabItemLabelAndCloseButton( ImDrawList* draw_list, const ImRect& bb,
 // Render helpers
 // AVOID USING OUTSIDE OF IMGUI.CPP! NOT FOR PUBLIC CONSUMPTION. THOSE FUNCTIONS ARE A MESS. THEIR SIGNATURE AND BEHAVIOR WILL CHANGE, THEY NEED TO BE REFACTORED INTO SOMETHING DECENT.
 // NB: All position are in absolute pixels coordinates (we are never using window coordinates internally)
-IMGUI_API bool ImFontRtlTextNeedsShape( const char* text_begin,
-                                        const char* text_end );
+IMGUI_API bool  ImFontRtlTextNeedsShape( const char* text_begin,
+                                         const char* text_end );
 IMGUI_API float ImFontRtlGetFontUnitScale( ImFont* font, ImFontBaked* baked );
-IMGUI_API void RenderText( ImVec2 pos, const char* text,
-                           const char* text_end             = NULL,
-                           bool        hide_text_after_hash = true );
-IMGUI_API void RenderTextWrapped( ImVec2 pos, const char* text,
-                                  const char* text_end, float wrap_width );
-IMGUI_API void RenderTextClipped( const ImVec2& pos_min, const ImVec2& pos_max,
-                                  const char* text, const char* text_end,
-                                  const ImVec2* text_size_if_known,
-                                  const ImVec2& align     = ImVec2( 0, 0 ),
-                                  const ImRect* clip_rect = NULL );
-IMGUI_API void RenderTextClippedEx(
+IMGUI_API void  RenderText( ImVec2 pos, const char* text,
+                            const char* text_end             = NULL,
+                            bool        hide_text_after_hash = true );
+IMGUI_API void  RenderTextWrapped( ImVec2 pos, const char* text,
+                                   const char* text_end, float wrap_width );
+IMGUI_API void  RenderTextClipped( const ImVec2& pos_min, const ImVec2& pos_max,
+                                   const char* text, const char* text_end,
+                                   const ImVec2* text_size_if_known,
+                                   const ImVec2& align     = ImVec2( 0, 0 ),
+                                   const ImRect* clip_rect = NULL );
+IMGUI_API void  RenderTextClippedEx(
     ImDrawList* draw_list, const ImVec2& pos_min, const ImVec2& pos_max,
     const char* text, const char* text_end, const ImVec2* text_size_if_known,
     const ImVec2& align = ImVec2( 0, 0 ), const ImRect* clip_rect = NULL );

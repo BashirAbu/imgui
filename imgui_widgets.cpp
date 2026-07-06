@@ -246,6 +246,86 @@ static void TextExRenderRightToLeft( ImVec2 pos, float align_width,
 	}
 }
 
+// [RTL] Returns true when right-to-left layout is active.
+static inline bool ImIsRtlLayout()
+{
+	ImGuiContext& g = *GImGui;
+	return ( g.IO.ConfigFlags & ImGuiConfigFlags_RightToLeft ) != 0;
+}
+
+// [RTL] Layout result for a framed widget (frame + trailing label).
+// In LTR the frame is at the cursor and the label follows on its right.
+// In RTL the whole item is right-aligned to the content region and horizontal
+// flow runs leftward: the frame stays on the left and the label reads on its
+// right (the label ends at the item's right edge). When following a SameLine()
+// the item's right edge sits at the running (leftward) cursor instead of the
+// work rect margin. LabelX is valid for both directions (label draw X).
+struct ImRtlFrameLayout
+{
+	bool  Rtl;
+	float FrameX;
+	float LabelX;
+	float ItemMinX;
+	float ItemMaxX;
+};
+
+static ImRtlFrameLayout ImCalcRtlFrameLayout( ImGuiWindow* window,
+                                              float frame_w, float label_w,
+                                              bool right_align = true )
+{
+	ImGuiContext&     g       = *GImGui;
+	const ImGuiStyle& style   = g.Style;
+	const float       spacing = style.ItemInnerSpacing.x;
+	const float       item_w =
+	    frame_w + ( label_w > 0.0f ? spacing + label_w : 0.0f );
+
+	IM_UNUSED( right_align );
+	ImRtlFrameLayout r;
+	r.Rtl = ImIsRtlLayout();
+	if( r.Rtl )
+	{
+		// Right-align the whole item. Horizontal flow runs leftward: on a fresh
+		// line the item's right edge sits at the work rect margin; following a
+		// SameLine() it sits at the running (leftward) cursor. The frame stays
+		// on the left and the label reads on its right. We move DC.CursorPos.x
+		// so downstream layout tracking stays consistent.
+		const float right      = window->DC.IsSameLine ? window->DC.CursorPos.x
+		                                               : window->WorkRect.Max.x;
+		const float item_left  = right - item_w;
+		window->DC.CursorPos.x = item_left;
+		r.FrameX               = item_left;
+		r.LabelX   = item_left + frame_w + ( label_w > 0.0f ? spacing : 0.0f );
+		r.ItemMinX = item_left;
+		r.ItemMaxX = item_left + item_w;
+	}
+	else
+	{
+		const float cursor_x = window->DC.CursorPos.x;
+		r.FrameX             = cursor_x;
+		r.LabelX             = cursor_x + frame_w + spacing;
+		r.ItemMinX           = cursor_x;
+		r.ItemMaxX           = cursor_x + item_w;
+	}
+	return r;
+}
+
+// [RTL] Right-align a self-contained item of width 'item_w'. Updates
+// window->DC.CursorPos.x so downstream layout tracking (SameLine flowing
+// leftward, groups, content extent) stays consistent, and returns the new left
+// X. On a fresh line the item's right edge sits at the work rect margin;
+// following a SameLine() it sits at the running (leftward) cursor. In LTR this
+// is a no-op returning the current cursor X.
+static inline float ImRtlPlaceItem( ImGuiWindow* window, float item_w )
+{
+	if( !ImIsRtlLayout() )
+		return window->DC.CursorPos.x;
+	const float right =
+	    window->DC.IsSameLine ? window->DC.CursorPos.x : window->WorkRect.Max.x;
+	const float item_left  = right - item_w;
+	window->DC.CursorPos.x = item_left;
+	return item_left;
+}
+
 void ImGui::TextEx( const char* text, const char* text_end,
                     ImGuiTextFlags flags )
 {
@@ -279,16 +359,26 @@ void ImGui::TextEx( const char* text, const char* text_end,
 		        : 0.0f;
 		const ImVec2 text_size =
 		    CalcTextSize( text_begin, text_end, false, wrap_width );
+		// [RTL] On a fresh line the text spans the content region and is drawn
+		// right-aligned; following a SameLine() it behaves like a normal item
+		// flowing leftward (sized to the text) so it doesn't overlap neighbors.
+		const bool  rtl_same_line = rtl_layout && window->DC.IsSameLine;
 		const float rtl_align_width =
-		    rtl_layout
-		        ? ( wrap_enabled ? wrap_width : GetContentRegionAvail().x )
-		        : text_size.x;
+		    rtl_layout ? ( rtl_same_line
+		                       ? text_size.x
+		                       : ( wrap_enabled ? wrap_width
+		                                        : GetContentRegionAvail().x ) )
+		               : text_size.x;
 		const ImVec2 item_size =
 		    rtl_layout
 		        ? ImVec2( ImMax( text_size.x, rtl_align_width ), text_size.y )
 		        : text_size;
 
-		ImRect bb( text_pos, text_pos + item_size );
+		ImVec2 render_pos = text_pos;
+		if( rtl_same_line )
+			render_pos.x = ImRtlPlaceItem( window, item_size.x );
+
+		ImRect bb( render_pos, render_pos + item_size );
 		ItemSize( item_size, 0.0f );
 		if( !ItemAdd( bb, 0 ) )
 			return;
@@ -589,6 +679,8 @@ void ImGui::BulletTextV( const char* fmt, va_list args )
 	            label_size.y ); // Empty text doesn't add padding
 	ImVec2 pos = window->DC.CursorPos;
 	pos.y += window->DC.CurrLineTextBaseOffset;
+	// [RTL] Right-align the whole bullet+text item (and flow leftward after SameLine).
+	pos.x = ImRtlPlaceItem( window, total_size.x );
 	ItemSize( total_size, 0.0f );
 	const ImRect bb( pos, pos + total_size );
 	if( !ItemAdd( bb, 0 ) )
@@ -596,12 +688,26 @@ void ImGui::BulletTextV( const char* fmt, va_list args )
 
 	// Render
 	ImU32 text_col = GetColorU32( ImGuiCol_Text );
-	RenderBullet( window->DrawList,
-	              bb.Min + ImVec2( style.FramePadding.x + g.FontSize * 0.5f,
-	                               g.FontSize * 0.5f ),
-	              text_col );
-	RenderText( bb.Min + ImVec2( g.FontSize + style.FramePadding.x * 2, 0.0f ),
-	            text_begin, text_end, false );
+	if( ImIsRtlLayout() )
+	{
+		// Bullet on the right edge, text laid out to its left.
+		RenderBullet(
+		    window->DrawList,
+		    ImVec2( bb.Max.x - style.FramePadding.x - g.FontSize * 0.5f,
+		            bb.Min.y + g.FontSize * 0.5f ),
+		    text_col );
+		RenderText( ImVec2( bb.Min.x, bb.Min.y ), text_begin, text_end, false );
+	}
+	else
+	{
+		RenderBullet( window->DrawList,
+		              bb.Min + ImVec2( style.FramePadding.x + g.FontSize * 0.5f,
+		                               g.FontSize * 0.5f ),
+		              text_col );
+		RenderText( bb.Min +
+		                ImVec2( g.FontSize + style.FramePadding.x * 2, 0.0f ),
+		            text_begin, text_end, false );
+	}
 }
 
 //-------------------------------------------------------------------------
@@ -1024,6 +1130,9 @@ bool ImGui::ButtonEx( const char* label, const ImVec2& size_arg,
 	    CalcItemSize( size_arg, label_size.x + style.FramePadding.x * 2.0f,
 	                  label_size.y + style.FramePadding.y * 2.0f );
 
+	// [RTL] Right-align the whole button (and flow leftward after SameLine).
+	pos.x = ImRtlPlaceItem( window, size.x );
+
 	const ImRect bb( pos, pos + size );
 	ItemSize( size, style.FramePadding.y );
 	if( !ItemAdd( bb, id ) )
@@ -1041,9 +1150,12 @@ bool ImGui::ButtonEx( const char* label, const ImVec2& size_arg,
 
 	if( g.LogEnabled )
 		LogSetNextTextDecoration( "[", "]" );
+	// [RTL] Right-align the label text inside the button frame.
+	ImVec2 button_text_align = style.ButtonTextAlign;
+	if( ImIsRtlLayout() )
+		button_text_align.x = 1.0f - button_text_align.x;
 	RenderTextClipped( bb.Min + style.FramePadding, bb.Max - style.FramePadding,
-	                   label, label_end, &label_size, style.ButtonTextAlign,
-	                   &bb );
+	                   label, label_end, &label_size, button_text_align, &bb );
 
 	// Automatically close popups
 	//if (pressed && !(flags & ImGuiButtonFlags_DontClosePopups) && (window->Flags & ImGuiWindowFlags_Popup))
@@ -1111,9 +1223,12 @@ bool ImGui::ArrowButtonEx( const char* str_id, ImGuiDir dir, ImVec2 size,
 	if( window->SkipItems )
 		return false;
 
-	const ImGuiID id = window->GetID( str_id );
-	const ImRect  bb( window->DC.CursorPos, window->DC.CursorPos + size );
-	const float   default_size = GetFrameHeight();
+	const ImGuiID id        = window->GetID( str_id );
+	ImVec2        arrow_pos = window->DC.CursorPos;
+	// [RTL] Right-align the arrow button (and flow leftward after SameLine).
+	arrow_pos.x = ImRtlPlaceItem( window, size.x );
+	const ImRect bb( arrow_pos, arrow_pos + size );
+	const float  default_size = GetFrameHeight();
 	ItemSize( size,
 	          ( size.y >= default_size ) ? g.Style.FramePadding.y : -1.0f );
 	if( !ItemAdd( bb, id ) )
@@ -1612,14 +1727,14 @@ bool ImGui::Checkbox( const char* label, bool* v )
 	const char*       label_end  = FindRenderedTextEnd( label );
 	const ImVec2      label_size = CalcTextSize( label, label_end, false );
 
-	const float  square_sz = GetFrameHeight();
-	const ImVec2 pos       = window->DC.CursorPos;
+	const float            square_sz = GetFrameHeight();
+	const ImVec2           pos       = window->DC.CursorPos;
+	const ImRtlFrameLayout rl =
+	    ImCalcRtlFrameLayout( window, square_sz, label_size.x );
 	const ImRect total_bb(
-	    pos, pos + ImVec2( square_sz +
-	                           ( label_size.x > 0.0f
-	                                 ? style.ItemInnerSpacing.x + label_size.x
-	                                 : 0.0f ),
-	                       label_size.y + style.FramePadding.y * 2.0f ) );
+	    ImVec2( rl.ItemMinX, pos.y ),
+	    ImVec2( rl.ItemMaxX,
+	            pos.y + label_size.y + style.FramePadding.y * 2.0f ) );
 	ItemSize( total_bb, style.FramePadding.y );
 	const bool is_visible = ItemAdd( total_bb, id );
 	const bool is_multi_select =
@@ -1658,7 +1773,8 @@ bool ImGui::Checkbox( const char* label, bool* v )
 		MarkItemEdited( id );
 	}
 
-	const ImRect check_bb( pos, pos + ImVec2( square_sz, square_sz ) );
+	const ImRect check_bb( ImVec2( rl.FrameX, pos.y ),
+	                       ImVec2( rl.FrameX + square_sz, pos.y + square_sz ) );
 	const bool   mixed_value =
 	    ( g.LastItemData.ItemFlags & ImGuiItemFlags_MixedValue ) != 0;
 	if( is_visible )
@@ -1690,8 +1806,8 @@ bool ImGui::Checkbox( const char* label, bool* v )
 			                 square_sz - pad * 2.0f );
 		}
 	}
-	const ImVec2 label_pos = ImVec2( check_bb.Max.x + style.ItemInnerSpacing.x,
-	                                 check_bb.Min.y + style.FramePadding.y );
+	const ImVec2 label_pos =
+	    ImVec2( rl.LabelX, check_bb.Min.y + style.FramePadding.y );
 	if( g.LogEnabled )
 		LogRenderedText( &label_pos, mixed_value ? "[~]" : *v ? "[x]" : "[ ]" );
 	if( is_visible && label_size.x > 0.0f )
@@ -1763,15 +1879,17 @@ bool ImGui::RadioButton( const char* label, bool active )
 	const char*       label_end  = FindRenderedTextEnd( label );
 	const ImVec2      label_size = CalcTextSize( label, label_end, false );
 
-	const float  square_sz = GetFrameHeight();
-	const ImVec2 pos       = window->DC.CursorPos;
-	const ImRect check_bb( pos, pos + ImVec2( square_sz, square_sz ) );
+	const float            square_sz = GetFrameHeight();
+	const ImVec2           pos       = window->DC.CursorPos;
+	const ImRtlFrameLayout rl =
+	    ImCalcRtlFrameLayout( window, square_sz, label_size.x,
+	                          /*right_align=*/false );
+	const ImRect check_bb( ImVec2( rl.FrameX, pos.y ),
+	                       ImVec2( rl.FrameX + square_sz, pos.y + square_sz ) );
 	const ImRect total_bb(
-	    pos, pos + ImVec2( square_sz +
-	                           ( label_size.x > 0.0f
-	                                 ? style.ItemInnerSpacing.x + label_size.x
-	                                 : 0.0f ),
-	                       label_size.y + style.FramePadding.y * 2.0f ) );
+	    ImVec2( rl.ItemMinX, pos.y ),
+	    ImVec2( rl.ItemMaxX,
+	            pos.y + label_size.y + style.FramePadding.y * 2.0f ) );
 	ItemSize( total_bb, style.FramePadding.y );
 	if( !ItemAdd( total_bb, id ) )
 		return false;
@@ -1812,8 +1930,8 @@ bool ImGui::RadioButton( const char* label, bool active )
 		                             num_segment, style.FrameBorderSize );
 	}
 
-	ImVec2 label_pos = ImVec2( check_bb.Max.x + style.ItemInnerSpacing.x,
-	                           check_bb.Min.y + style.FramePadding.y );
+	ImVec2 label_pos =
+	    ImVec2( rl.LabelX, check_bb.Min.y + style.FramePadding.y );
 	if( g.LogEnabled )
 		LogRenderedText( &label_pos, active ? "(x)" : "( )" );
 	if( label_size.x > 0.0f )
@@ -1846,6 +1964,8 @@ void ImGui::ProgressBar( float fraction, const ImVec2& size_arg,
 	ImVec2 pos  = window->DC.CursorPos;
 	ImVec2 size = CalcItemSize( size_arg, CalcItemWidth(),
 	                            g.FontSize + style.FramePadding.y * 2.0f );
+	// [RTL] Right-align the whole progress bar (and flow leftward after SameLine).
+	pos.x = ImRtlPlaceItem( window, size.x );
 	ImRect bb( pos, pos + size );
 	ItemSize( size, style.FramePadding.y );
 	if( !ItemAdd( bb, 0 ) )
@@ -2215,10 +2335,15 @@ void ImGui::SeparatorTextEx( ImGuiID id, const char* label,
 
 	const float label_avail_w =
 	    ImMax( 0.0f, sep2_x2 - sep1_x1 - padding.x * 2.0f );
+	// [RTL] Place the label towards the right edge by flipping the horizontal
+	// alignment factor.
+	const float  sep_align_x = ImIsRtlLayout()
+	                               ? ( 1.0f - style.SeparatorTextAlign.x )
+	                               : style.SeparatorTextAlign.x;
 	const ImVec2 label_pos(
 	    pos.x + padding.x +
-	        ImMax( 0.0f, ( label_avail_w - label_size.x - extra_w ) *
-	                         style.SeparatorTextAlign.x ),
+	        ImMax( 0.0f,
+	               ( label_avail_w - label_size.x - extra_w ) * sep_align_x ),
 	    pos.y + text_baseline_y ); // FIXME-ALIGN
 
 	// This allows using SameLine() to position something in the 'extra_w'
@@ -2465,21 +2590,19 @@ bool ImGui::BeginCombo( const char* label, const char* preview_value,
 	      ( preview_value != NULL ) )
 	        ? CalcTextSize( preview_value, NULL, false ).x
 	        : 0.0f;
-	const float  w = ( flags & ImGuiComboFlags_NoPreview )
-	                     ? arrow_size
-	                     : ( ( flags & ImGuiComboFlags_WidthFitPreview )
-	                             ? ( arrow_size + preview_width +
-	                                 style.FramePadding.x * 2.0f )
-	                             : CalcItemWidth() );
-	const ImRect bb(
-	    window->DC.CursorPos,
-	    window->DC.CursorPos +
-	        ImVec2( w, label_size.y + style.FramePadding.y * 2.0f ) );
-	const ImRect total_bb(
-	    bb.Min, bb.Max + ImVec2( label_size.x > 0.0f
-	                                 ? style.ItemInnerSpacing.x + label_size.x
-	                                 : 0.0f,
-	                             0.0f ) );
+	const float w = ( flags & ImGuiComboFlags_NoPreview )
+	                    ? arrow_size
+	                    : ( ( flags & ImGuiComboFlags_WidthFitPreview )
+	                            ? ( arrow_size + preview_width +
+	                                style.FramePadding.x * 2.0f )
+	                            : CalcItemWidth() );
+	const ImRtlFrameLayout rl = ImCalcRtlFrameLayout( window, w, label_size.x );
+	const ImRect bb( ImVec2( rl.FrameX, window->DC.CursorPos.y ),
+	                 ImVec2( rl.FrameX + w, window->DC.CursorPos.y +
+	                                            label_size.y +
+	                                            style.FramePadding.y * 2.0f ) );
+	const ImRect total_bb( ImVec2( rl.ItemMinX, window->DC.CursorPos.y ),
+	                       ImVec2( rl.ItemMaxX, bb.Max.y ) );
 	ItemSize( total_bb, style.FramePadding.y );
 	if( !ItemAdd( total_bb, id, &bb ) )
 		return false;
@@ -2544,9 +2667,8 @@ bool ImGui::BeginCombo( const char* label, const char* preview_value,
 		                   NULL );
 	}
 	if( label_size.x > 0 )
-		RenderText( ImVec2( bb.Max.x + style.ItemInnerSpacing.x,
-		                    bb.Min.y + style.FramePadding.y ),
-		            label, label_end, false );
+		RenderText( ImVec2( rl.LabelX, bb.Min.y + style.FramePadding.y ), label,
+		            label_end, false );
 
 	if( !popup_open )
 		return false;
@@ -3612,18 +3734,15 @@ bool ImGui::DragScalar( const char* label, ImGuiDataType data_type,
 	        ? g.NextItemData.ColorMarker
 	        : 0;
 
-	const char*  label_end  = FindRenderedTextEnd( label );
-	const ImVec2 label_size = CalcTextSize( label, label_end, false );
-	const ImRect frame_bb(
-	    window->DC.CursorPos,
-	    window->DC.CursorPos +
-	        ImVec2( w, label_size.y + style.FramePadding.y * 2.0f ) );
-	const ImRect total_bb(
-	    frame_bb.Min,
-	    frame_bb.Max + ImVec2( label_size.x > 0.0f
-	                               ? style.ItemInnerSpacing.x + label_size.x
-	                               : 0.0f,
-	                           0.0f ) );
+	const char*            label_end  = FindRenderedTextEnd( label );
+	const ImVec2           label_size = CalcTextSize( label, label_end, false );
+	const ImRtlFrameLayout rl = ImCalcRtlFrameLayout( window, w, label_size.x );
+	const ImRect           frame_bb(
+	    ImVec2( rl.FrameX, window->DC.CursorPos.y ),
+	    ImVec2( rl.FrameX + w, window->DC.CursorPos.y + label_size.y +
+	                               style.FramePadding.y * 2.0f ) );
+	const ImRect total_bb( ImVec2( rl.ItemMinX, window->DC.CursorPos.y ),
+	                       ImVec2( rl.ItemMaxX, frame_bb.Max.y ) );
 
 	const bool temp_input_allowed = ( flags & ImGuiSliderFlags_NoInput ) == 0;
 	ItemSize( total_bb, style.FramePadding.y );
@@ -3722,8 +3841,7 @@ bool ImGui::DragScalar( const char* label, ImGuiDataType data_type,
 	                   NULL, ImVec2( 0.5f, 0.5f ) );
 
 	if( label_size.x > 0.0f )
-		RenderText( ImVec2( frame_bb.Max.x + style.ItemInnerSpacing.x,
-		                    frame_bb.Min.y + style.FramePadding.y ),
+		RenderText( ImVec2( rl.LabelX, frame_bb.Min.y + style.FramePadding.y ),
 		            label, label_end, false );
 
 	IMGUI_TEST_ENGINE_ITEM_INFO(
@@ -4516,18 +4634,15 @@ bool ImGui::SliderScalar( const char* label, ImGuiDataType data_type,
 	        ? g.NextItemData.ColorMarker
 	        : 0;
 
-	const char*  label_end  = FindRenderedTextEnd( label );
-	const ImVec2 label_size = CalcTextSize( label, label_end, false );
-	const ImRect frame_bb(
-	    window->DC.CursorPos,
-	    window->DC.CursorPos +
-	        ImVec2( w, label_size.y + style.FramePadding.y * 2.0f ) );
-	const ImRect total_bb(
-	    frame_bb.Min,
-	    frame_bb.Max + ImVec2( label_size.x > 0.0f
-	                               ? style.ItemInnerSpacing.x + label_size.x
-	                               : 0.0f,
-	                           0.0f ) );
+	const char*            label_end  = FindRenderedTextEnd( label );
+	const ImVec2           label_size = CalcTextSize( label, label_end, false );
+	const ImRtlFrameLayout rl = ImCalcRtlFrameLayout( window, w, label_size.x );
+	const ImRect           frame_bb(
+	    ImVec2( rl.FrameX, window->DC.CursorPos.y ),
+	    ImVec2( rl.FrameX + w, window->DC.CursorPos.y + label_size.y +
+	                               style.FramePadding.y * 2.0f ) );
+	const ImRect total_bb( ImVec2( rl.ItemMinX, window->DC.CursorPos.y ),
+	                       ImVec2( rl.ItemMaxX, frame_bb.Max.y ) );
 
 	const bool temp_input_allowed = ( flags & ImGuiSliderFlags_NoInput ) == 0;
 	ItemSize( total_bb, style.FramePadding.y );
@@ -4621,8 +4736,7 @@ bool ImGui::SliderScalar( const char* label, ImGuiDataType data_type,
 	                   NULL, ImVec2( 0.5f, 0.5f ) );
 
 	if( label_size.x > 0.0f )
-		RenderText( ImVec2( frame_bb.Max.x + style.ItemInnerSpacing.x,
-		                    frame_bb.Min.y + style.FramePadding.y ),
+		RenderText( ImVec2( rl.LabelX, frame_bb.Min.y + style.FramePadding.y ),
 		            label, label_end, false );
 
 	IMGUI_TEST_ENGINE_ITEM_INFO(
@@ -4632,7 +4746,6 @@ bool ImGui::SliderScalar( const char* label, ImGuiDataType data_type,
 	return value_changed;
 }
 
-// Add multiple sliders on 1 line for compact edition of multiple components
 bool ImGui::SliderScalarN( const char* label, ImGuiDataType data_type, void* v,
                            int components, const void* v_min, const void* v_max,
                            const char* format, ImGuiSliderFlags flags )
@@ -5657,10 +5770,8 @@ InputTextBuildRightToLeftCaretMap( ImGuiContext& g, const char* text_begin,
 
 	kbts_direction                  paragraph_direction = KBTS_DIRECTION_LTR;
 	ImVector<InputTextRtlGlyphInfo> visual_glyphs;
-	const float                     total_width =
-	    InputTextBuildRightToLeftVisualGlyphs( g, text_begin, text_end,
-	                                           &visual_glyphs,
-	                                           &paragraph_direction );
+	const float total_width = InputTextBuildRightToLeftVisualGlyphs(
+	    g, text_begin, text_end, &visual_glyphs, &paragraph_direction );
 
 	ImVector<float> boundary_x;
 	boundary_x.resize( boundaries.Size );
@@ -5738,10 +5849,10 @@ static void InputTextGetRightToLeftSelectionRanges(
 	InputTextBuildRightToLeftVisualGlyphs( g, text_begin, text_end,
 	                                       &visual_glyphs );
 
-	float x        = 0.0f;
-	bool  has_run  = false;
-	float run_min  = 0.0f;
-	float run_max  = 0.0f;
+	float x       = 0.0f;
+	bool  has_run = false;
+	float run_min = 0.0f;
+	float run_max = 0.0f;
 	for( const InputTextRtlGlyphInfo& glyph : visual_glyphs )
 	{
 		const float x0 = x;
@@ -5846,8 +5957,13 @@ static void STB_TEXTEDIT_LAYOUTROW( StbTexteditRow* r, ImGuiInputTextState* obj,
 	    obj->Ctx, text + line_start_idx, text + obj->TextLen,
 	    text + obj->TextLen, &text_remaining, NULL,
 	    ImDrawTextFlags_StopOnNewLine | ImDrawTextFlags_WrapKeepBlanks );
-	r->x0               = 0.0f;
-	r->x1               = size.x;
+	// [RTL] Right-align this line's display: offset x0 so hit-testing matches the
+	// shifted rendering.
+	const float rtl_off = ( obj->RtlAlignWidth > 0.0f )
+	                          ? ImMax( 0.0f, obj->RtlAlignWidth - size.x )
+	                          : 0.0f;
+	r->x0               = rtl_off;
+	r->x1               = rtl_off + size.x;
 	r->baseline_y_delta = size.y;
 	r->ymin             = 0.0f;
 	r->ymax             = size.y;
@@ -6352,6 +6468,7 @@ void ImGui::PushPasswordFont()
 	g.FontBaked->FallbackGlyphIndex =
 	    g.FontBaked->Glyphs.index_from_ptr( glyph );
 	g.FontBaked->FallbackAdvanceX = glyph->AdvanceX;
+	g.InputTextPasswordFontActive = true;
 }
 
 void ImGui::PopPasswordFont()
@@ -6363,6 +6480,7 @@ void ImGui::PopPasswordFont()
 	g.FontBaked->FallbackAdvanceX   = backup->FallbackAdvanceX;
 	g.FontBaked->IndexLookup.swap( backup->IndexLookup );
 	g.FontBaked->IndexAdvanceX.swap( backup->IndexAdvanceX );
+	g.InputTextPasswordFontActive = false;
 	IM_ASSERT( backup->IndexAdvanceX.Size == 0 &&
 	           backup->IndexLookup.Size == 0 );
 }
@@ -6670,6 +6788,22 @@ InputTextLineIndexGetPosOffset( ImGuiContext& g, ImGuiInputTextState* state,
 	offset.x = InputTextCalcTextSize( &g, line_start, cursor_ptr, buf_end, NULL,
 	                                  NULL, ImDrawTextFlags_WrapKeepBlanks )
 	               .x;
+	// [RTL] Shift the cursor by this line's right-align offset.
+	if( state != NULL && state->RtlAlignWidth > 0.0f )
+	{
+		const char* line_end = line_index->get_line_end( buf, line_no );
+		const float line_w =
+		    InputTextCalcTextSize( &g, line_start, line_end, buf_end, NULL,
+		                           NULL, ImDrawTextFlags_WrapKeepBlanks )
+		        .x;
+		// For Arabic/bidi lines the logical prefix width does not map to the
+		// visual caret position, so use the shaped caret map to place the cursor
+		// on the correct visual side.
+		if( ImFontRtlTextNeedsShape( line_start, line_end ) )
+			offset.x = InputTextGetRightToLeftCaretX(
+			    g, line_start, line_end, (int)( cursor_ptr - line_start ) );
+		offset.x += ImMax( 0.0f, state->RtlAlignWidth - line_w );
+	}
 	offset.y = ( line_no + 1 ) * g.FontSize;
 	return offset;
 }
@@ -6761,9 +6895,14 @@ bool ImGui::InputTextEx( const char* label, const char* hint, char* buf,
 	                                 : 0.0f ),
 	            frame_size.y );
 
-	const ImRect frame_bb( window->DC.CursorPos,
-	                       window->DC.CursorPos + frame_size );
-	const ImRect total_bb( frame_bb.Min, frame_bb.Min + total_size );
+	const ImRtlFrameLayout rl =
+	    ImCalcRtlFrameLayout( window, frame_size.x, label_size.x );
+	const ImRect frame_bb( ImVec2( rl.FrameX, window->DC.CursorPos.y ),
+	                       ImVec2( rl.FrameX, window->DC.CursorPos.y ) +
+	                           frame_size );
+	const ImRect total_bb( ImVec2( rl.ItemMinX, window->DC.CursorPos.y ),
+	                       ImVec2( rl.ItemMinX, window->DC.CursorPos.y ) +
+	                           total_size );
 
 	ImGuiWindow*      draw_window = window;
 	ImVec2            inner_size  = frame_size;
@@ -6857,6 +6996,20 @@ bool ImGui::InputTextEx( const char* label, const char* hint, char* buf,
 	const bool is_readonly = ( flags & ImGuiInputTextFlags_ReadOnly ) != 0;
 	const bool is_password = ( flags & ImGuiInputTextFlags_Password ) != 0;
 	const bool is_undoable = ( flags & ImGuiInputTextFlags_NoUndoRedo ) == 0;
+
+	// [RTL] Password and multiline fields don't use the single-line bidi editing
+	// path, but in RTL layout we still right-align each displayed line within the
+	// frame. 'rtl_align_width' is the available text width; 0 disables it.
+	const bool rtl_display_align =
+	    ( g.IO.ConfigFlags & ImGuiConfigFlags_RightToLeft ) != 0 &&
+	    ( is_password || is_multiline );
+	const float rtl_align_width =
+	    rtl_display_align
+	        ? ImMax( 0.0f, inner_size.x - style.FramePadding.x * 2.0f )
+	        : 0.0f;
+	if( state != NULL )
+		state->RtlAlignWidth = rtl_align_width;
+
 	const bool is_resizable =
 	    ( flags & ImGuiInputTextFlags_CallbackResize ) != 0;
 	if( is_resizable )
@@ -7869,7 +8022,7 @@ bool ImGui::InputTextEx( const char* label, const char* hint, char* buf,
 	//GetForegroundDrawList()->AddRect(draw_pos + ImVec2(0, line_visible_n0 * g.FontSize), draw_pos + ImVec2(frame_size.x, line_visible_n1 * g.FontSize), IM_COL32(255, 0, 0, 255));
 
 	// Calculate blinking cursor position
-	const bool input_text_rtl = InputTextIsRightToLeft( g, flags );
+	const bool   input_text_rtl = InputTextIsRightToLeft( g, flags );
 	const ImVec2 cursor_offset =
 	    render_cursor && state
 	        ? ( input_text_rtl ? InputTextLineIndexGetRightToLeftPosOffset(
@@ -7901,7 +8054,11 @@ bool ImGui::InputTextEx( const char* label, const char* hint, char* buf,
 		if( render_cursor && state->CursorFollow )
 		{
 			// Horizontal scroll in chunks of quarter width
-			if( !( flags & ImGuiInputTextFlags_NoHorizontalScroll ) )
+			// [RTL] When each line is right-aligned to the frame width
+			// (password/multiline in RTL), horizontal scrolling would fight the
+			// alignment and make the text drift/center, so keep it pinned.
+			if( !( flags & ImGuiInputTextFlags_NoHorizontalScroll ) &&
+			    rtl_align_width <= 0.0f )
 			{
 				const float scroll_increment_x = inner_size.x * 0.25f;
 				const float visible_width = inner_size.x - style.FramePadding.x;
@@ -8038,6 +8195,11 @@ bool ImGui::InputTextEx( const char* label, const char* hint, char* buf,
 					ImRect rect;
 					rect.Min.x = draw_pos.x - draw_scroll.x +
 					             CalcTextSize( p, line_selected_begin ).x;
+					// [RTL] Add this line's right-align offset.
+					if( rtl_align_width > 0.0f )
+						rect.Min.x +=
+						    ImMax( 0.0f, rtl_align_width -
+						                     CalcTextSize( p, p_eol ).x );
 					rect.Max.x = rect.Min.x + rect_width;
 					rect.Min.y = rect_y0;
 					rect.Max.y = rect_y1;
@@ -8069,16 +8231,39 @@ bool ImGui::InputTextEx( const char* label, const char* hint, char* buf,
 	      ( buf_display_end - buf_display ) < buf_display_max_length ) &&
 	    ( text_col & IM_COL32_A_MASK ) &&
 	    ( line_visible_n0 < line_visible_n1 ) )
-		g.Font->RenderText(
-		    draw_window->DrawList, g.FontSize,
-		    draw_pos - draw_scroll +
-		        ImVec2( input_text_rtl_render_offset,
-		                line_visible_n0 * g.FontSize ),
-		    text_col, clip_rect.AsVec4(),
-		    line_index->get_line_begin( buf_display, line_visible_n0 ),
-		    line_index->get_line_end( buf_display, line_visible_n1 - 1 ),
-		    wrap_width,
-		    ImDrawTextFlags_WrapKeepBlanks | ImDrawTextFlags_CpuFineClip );
+	{
+		if( rtl_align_width > 0.0f )
+		{
+			// [RTL] Render each visible line right-aligned within the frame.
+			for( int line_n = line_visible_n0; line_n < line_visible_n1;
+			     line_n++ )
+			{
+				const char* line_b =
+				    line_index->get_line_begin( buf_display, line_n );
+				const char* line_e =
+				    line_index->get_line_end( buf_display, line_n );
+				const float line_w = CalcTextSize( line_b, line_e ).x;
+				const float off    = ImMax( 0.0f, rtl_align_width - line_w );
+				g.Font->RenderText(
+				    draw_window->DrawList, g.FontSize,
+				    draw_pos - draw_scroll + ImVec2( off, line_n * g.FontSize ),
+				    text_col, clip_rect.AsVec4(), line_b, line_e, wrap_width,
+				    ImDrawTextFlags_WrapKeepBlanks |
+				        ImDrawTextFlags_CpuFineClip );
+			}
+		}
+		else
+			g.Font->RenderText(
+			    draw_window->DrawList, g.FontSize,
+			    draw_pos - draw_scroll +
+			        ImVec2( input_text_rtl_render_offset,
+			                line_visible_n0 * g.FontSize ),
+			    text_col, clip_rect.AsVec4(),
+			    line_index->get_line_begin( buf_display, line_visible_n0 ),
+			    line_index->get_line_end( buf_display, line_visible_n1 - 1 ),
+			    wrap_width,
+			    ImDrawTextFlags_WrapKeepBlanks | ImDrawTextFlags_CpuFineClip );
+	}
 
 	// Render blinking cursor
 	if( render_cursor )
@@ -8151,8 +8336,7 @@ bool ImGui::InputTextEx( const char* label, const char* hint, char* buf,
 	}
 
 	if( label_size.x > 0 )
-		RenderText( ImVec2( frame_bb.Max.x + style.ItemInnerSpacing.x,
-		                    frame_bb.Min.y + style.FramePadding.y ),
+		RenderText( ImVec2( rl.LabelX, frame_bb.Min.y + style.FramePadding.y ),
 		            label, label_end, false );
 
 	if( value_changed )
@@ -8296,6 +8480,31 @@ bool ImGui::ColorEdit4( const char* label, float col[4],
 	const char*       label_display_end = FindRenderedTextEnd( label );
 	float             w_full            = CalcItemWidth();
 	g.NextItemData.ClearFlags();
+
+	// [RTL] Right-align the whole widget to the content region and draw the
+	// label on its right. The internal color widgets (drag sliders, color
+	// button, SameLine math) are laid out in LTR to keep hit-testing correct;
+	// only the whole block is shifted and the label reads on the right. Arabic
+	// glyph shaping is independent of the layout flag, so the label still shapes
+	// correctly.
+	const bool rtl_layout = ImIsRtlLayout() && ( label != label_display_end ) &&
+	                        !( flags & ImGuiColorEditFlags_NoLabel );
+	const float rtl_label_gap =
+	    rtl_layout ? CalcTextSize( label, label_display_end, false ).x +
+	                     style.ItemInnerSpacing.x
+	               : 0.0f;
+	const ImGuiConfigFlags rtl_backup_config_flags = g.IO.ConfigFlags;
+	if( rtl_layout )
+	{
+		const float item_w     = w_full + rtl_label_gap;
+		const float item_left  = window->DC.IsSameLine
+		                             ? ( window->DC.CursorPos.x - item_w )
+		                             : ImMax( window->DC.CursorPos.x,
+		                                      window->WorkRect.Max.x - item_w );
+		window->DC.CursorPos.x = item_left;
+		// Lay out the internals in LTR from the shifted origin.
+		g.IO.ConfigFlags &= ~ImGuiConfigFlags_RightToLeft;
+	}
 
 	BeginGroup();
 	PushID( label );
@@ -8537,6 +8746,10 @@ bool ImGui::ColorEdit4( const char* label, float col[4],
 		                  : w_full + style.ItemInnerSpacing.x );
 		TextEx( label, label_display_end );
 	}
+
+	// [RTL] Restore the layout flag that was disabled for the internal layout.
+	if( rtl_layout )
+		g.IO.ConfigFlags = rtl_backup_config_flags;
 
 	// Convert back
 	if( value_changed && picker_active_window == NULL )
@@ -9902,12 +10115,17 @@ bool ImGui::TreeNodeBehavior( ImGuiID id, ImGuiTreeNodeFlags flags,
 	// We allow clicking on the arrow section with keyboard modifiers held, in order to easily
 	// allow browsing a tree while preserving selection with code implementing multi-selection patterns.
 	// When clicking on the rest of the tree node we always disallow keyboard modifiers.
-	const float arrow_hit_x1 =
-	    ( text_pos.x - text_offset_x ) - style.TouchExtraPadding.x;
-	const float arrow_hit_x2 = ( text_pos.x - text_offset_x ) +
-	                           ( g.FontSize + padding.x * 2.0f ) +
-	                           style.TouchExtraPadding.x;
-	const bool  is_mouse_x_over_arrow =
+	// [RTL] Place the collapsing arrow on the right side of the row; the label
+	// is then right-aligned to its left.
+	const bool  rtl_tree    = ImIsRtlLayout();
+	const float arrow_box_w = g.FontSize + padding.x * 2.0f;
+	const float arrow_base_x =
+	    rtl_tree ? ( frame_bb.Max.x - padding.x - arrow_box_w )
+	             : ( text_pos.x - text_offset_x );
+	const float arrow_hit_x1 = arrow_base_x - style.TouchExtraPadding.x;
+	const float arrow_hit_x2 =
+	    arrow_base_x + arrow_box_w + style.TouchExtraPadding.x;
+	const bool is_mouse_x_over_arrow =
 	    ( g.IO.MousePos.x >= arrow_hit_x1 && g.IO.MousePos.x < arrow_hit_x2 );
 
 	const bool is_multi_select =
@@ -10040,14 +10258,18 @@ bool ImGui::TreeNodeBehavior( ImGuiID id, ImGuiTreeNodeFlags flags,
 			if( span_all_columns && !span_all_columns_label )
 				TablePopBackgroundChannel();
 			if( flags & ImGuiTreeNodeFlags_Bullet )
-				RenderBullet( window->DrawList,
-				              ImVec2( text_pos.x - text_offset_x * 0.60f,
-				                      text_pos.y + g.FontSize * 0.5f ),
-				              text_col );
+				RenderBullet(
+				    window->DrawList,
+				    ImVec2( rtl_tree ? ( arrow_base_x + arrow_box_w * 0.5f )
+				                     : ( text_pos.x - text_offset_x * 0.60f ),
+				            text_pos.y + g.FontSize * 0.5f ),
+				    text_col );
 			else if( !is_leaf )
 				RenderArrow(
 				    window->DrawList,
-				    ImVec2( text_pos.x - text_offset_x + padding.x,
+				    ImVec2( rtl_tree
+				                ? ( arrow_base_x + padding.x )
+				                : ( text_pos.x - text_offset_x + padding.x ),
 				            text_pos.y ),
 				    text_col,
 				    is_open ? ( ( flags & ImGuiTreeNodeFlags_UpsideDownArrow )
@@ -10055,7 +10277,7 @@ bool ImGui::TreeNodeBehavior( ImGuiID id, ImGuiTreeNodeFlags flags,
 				                    : ImGuiDir_Down )
 				            : ImGuiDir_Right,
 				    1.0f );
-			else // Leaf without bullet, left-adjusted text
+			else if( !rtl_tree ) // Leaf without bullet, left-adjusted text
 				text_pos.x -= text_offset_x - padding.x;
 			if( flags & ImGuiTreeNodeFlags_ClipLabelForTrailingButton )
 				frame_bb.Max.x -= g.FontSize + style.FramePadding.x;
@@ -10077,14 +10299,18 @@ bool ImGui::TreeNodeBehavior( ImGuiID id, ImGuiTreeNodeFlags flags,
 			if( span_all_columns && !span_all_columns_label )
 				TablePopBackgroundChannel();
 			if( flags & ImGuiTreeNodeFlags_Bullet )
-				RenderBullet( window->DrawList,
-				              ImVec2( text_pos.x - text_offset_x * 0.5f,
-				                      text_pos.y + g.FontSize * 0.5f ),
-				              text_col );
+				RenderBullet(
+				    window->DrawList,
+				    ImVec2( rtl_tree ? ( arrow_base_x + arrow_box_w * 0.5f )
+				                     : ( text_pos.x - text_offset_x * 0.5f ),
+				            text_pos.y + g.FontSize * 0.5f ),
+				    text_col );
 			else if( !is_leaf )
 				RenderArrow(
 				    window->DrawList,
-				    ImVec2( text_pos.x - text_offset_x + padding.x,
+				    ImVec2( rtl_tree
+				                ? ( arrow_base_x + padding.x )
+				                : ( text_pos.x - text_offset_x + padding.x ),
 				            text_pos.y + g.FontSize * 0.15f ),
 				    text_col,
 				    is_open ? ( ( flags & ImGuiTreeNodeFlags_UpsideDownArrow )
@@ -10102,7 +10328,21 @@ bool ImGui::TreeNodeBehavior( ImGuiID id, ImGuiTreeNodeFlags flags,
 			            text_pos.y + g.FontSize * 0.5f ) );
 
 		// Label
-		if( display_frame )
+		if( rtl_tree )
+		{
+			// Right-align the label to the left of the (right-side) arrow.
+			const float rtl_text_right =
+			    arrow_base_x - style.ItemInnerSpacing.x;
+			if( display_frame )
+				RenderTextClipped(
+				    ImVec2( frame_bb.Min.x + padding.x, text_pos.y ),
+				    ImVec2( rtl_text_right, frame_bb.Max.y ), label, label_end,
+				    &label_size, ImVec2( 1.0f, 0.0f ) );
+			else
+				RenderText( ImVec2( rtl_text_right - label_size.x, text_pos.y ),
+				            label, label_end, false );
+		}
+		else if( display_frame )
 			RenderTextClipped( text_pos, frame_bb.Max, label, label_end,
 			                   &label_size );
 		else
@@ -10573,11 +10813,17 @@ bool ImGui::Selectable( const char* label, bool selected,
 
 	// Text stays at the submission position. Alignment/clipping extents ignore SpanAllColumns.
 	if( is_visible )
+	{
+		// [RTL] Right-align the label inside the selectable span.
+		ImVec2 selectable_text_align = style.SelectableTextAlign;
+		if( ImIsRtlLayout() )
+			selectable_text_align.x = 1.0f - selectable_text_align.x;
 		RenderTextClipped(
 		    pos,
 		    ImVec2( ImMin( pos.x + size.x, window->WorkRect.Max.x ),
 		            pos.y + size.y ),
-		    label, label_end, &label_size, style.SelectableTextAlign, &bb );
+		    label, label_end, &label_size, selectable_text_align, &bb );
+	}
 
 #ifdef IMGUI_DEBUG_BOXSELECT
 	if( g.BoxSelectState.UnclipMode )
@@ -11356,8 +11602,9 @@ ImGuiMultiSelectIO* ImGui::EndMultiSelect()
 		      ms->IO.RangeSrcItem !=
 		          ImGuiSelectionUserData_Invalid ) ) // Can't read storage->RangeSrcItem here -> we want the state at beginning of the scope (see tests for easy failure)
 		{
-			IMGUI_DEBUG_LOG_SELECTION( "[selection] EndMultiSelect: Reset "
-			                           "RangeSrcItem.\n" ); // Will set be to NavId.
+			IMGUI_DEBUG_LOG_SELECTION(
+			    "[selection] EndMultiSelect: Reset "
+			    "RangeSrcItem.\n" ); // Will set be to NavId.
 			storage->RangeSrcItem = ImGuiSelectionUserData_Invalid;
 		}
 		if( ms->NavIdPassedBy == false &&
@@ -12172,6 +12419,13 @@ bool ImGui::BeginListBox( const char* label, const ImVec2& size_arg )
 	                           GetTextLineHeightWithSpacing() * 7.25f +
 	                               style.FramePadding.y * 2.0f ) );
 	ImVec2 frame_size = ImVec2( size.x, ImMax( size.y, label_size.y ) );
+	// [RTL] Right-align the whole list box (frame on the left, label on its
+	// right ending at the content region's right edge).
+	const float listbox_item_w =
+	    frame_size.x + ( label_size.x > 0.0f
+	                         ? style.ItemInnerSpacing.x + label_size.x
+	                         : 0.0f );
+	ImRtlPlaceItem( window, listbox_item_w );
 	ImRect frame_bb( window->DC.CursorPos, window->DC.CursorPos + frame_size );
 	ImRect bb( frame_bb.Min,
 	           frame_bb.Max +
@@ -14593,13 +14847,23 @@ bool ImGui::TabItemEx( ImGuiTabBar* tab_bar, const char* label, bool* p_open,
 	const bool is_central_section =
 	    ( tab->Flags & ImGuiTabItemFlags_SectionMask_ ) == 0;
 	size.x = tab->Width;
+	// [RTL] Tabs flow from the right edge of the bar leftwards, instead of from
+	// the left edge rightwards.
+	const bool rtl_tabs =
+	    ( g.IO.ConfigFlags & ImGuiConfigFlags_RightToLeft ) != 0;
 	if( is_central_section )
+	{
+		const float off = IM_TRUNC( tab->Offset - tab_bar->ScrollingAnim );
 		window->DC.CursorPos =
-		    tab_bar->BarRect.Min +
-		    ImVec2( IM_TRUNC( tab->Offset - tab_bar->ScrollingAnim ), 0.0f );
+		    rtl_tabs ? ImVec2( tab_bar->BarRect.Max.x - off - size.x,
+		                       tab_bar->BarRect.Min.y )
+		             : ( tab_bar->BarRect.Min + ImVec2( off, 0.0f ) );
+	}
 	else
 		window->DC.CursorPos =
-		    tab_bar->BarRect.Min + ImVec2( tab->Offset, 0.0f );
+		    rtl_tabs ? ImVec2( tab_bar->BarRect.Max.x - tab->Offset - size.x,
+		                       tab_bar->BarRect.Min.y )
+		             : ( tab_bar->BarRect.Min + ImVec2( tab->Offset, 0.0f ) );
 	ImVec2 pos = window->DC.CursorPos;
 	ImRect bb( pos, pos + size );
 
