@@ -2873,6 +2873,9 @@ enum ImGuiConfigFlags_
 	ImGuiConfigFlags_NoKeyboard =
 	    1
 	    << 6, // Instruct dear imgui to disable keyboard inputs and interactions. This is done by ignoring keyboard events and clearing existing states.
+	ImGuiConfigFlags_RightToLeft =
+	    1
+	    << 7, // Right-align text layout inside the current content region. Experimental RTL layout support.
 
 	// [Unused] User storage (to allow your backend/engine to communicate to code that may be shared between multiple projects. Those flags are NOT used by core Dear ImGui)
 	ImGuiConfigFlags_IsSRGB = 1 << 20, // Application is SRGB-aware.
