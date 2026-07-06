@@ -36,6 +36,7 @@ Index of this file:
 #include "imgui.h"
 #ifndef IMGUI_DISABLE
 #include "imgui_internal.h"
+#include "kb_text_shape.h"
 #ifdef IMGUI_ENABLE_FREETYPE
 #include "misc/freetype/imgui_freetype.h"
 #endif
@@ -4869,6 +4870,334 @@ const ImFontLoader* ImFontAtlasGetFontLoaderForStbTruetype()
 #endif // IMGUI_ENABLE_STB_TRUETYPE
 
 //-------------------------------------------------------------------------
+// [SECTION] Arabic shaping support (kb_text_shape)
+//-------------------------------------------------------------------------
+
+#ifdef IMGUI_ENABLE_STB_TRUETYPE
+
+const char* ImFontCalcWordWrapPositionEx(ImFont* font, float size, const char* text, const char* text_end, float wrap_width, ImDrawTextFlags flags);
+const char* ImTextCalcWordWrapNextLineStart(const char* text, const char* text_end, ImDrawTextFlags flags);
+
+struct ImFontRtlShapedGlyph
+{
+    int     GlyphId;
+    float   AdvanceX;
+    float   OffsetX;
+    float   OffsetY;
+};
+
+static bool ImFontRtlIsArabicCodepoint(unsigned int c)
+{
+    return (c >= 0x0600 && c <= 0x06FF) || (c >= 0x0750 && c <= 0x077F) || (c >= 0x08A0 && c <= 0x08FF) || (c >= 0xFB50 && c <= 0xFDFF) || (c >= 0xFE70 && c <= 0xFEFF);
+}
+
+static bool ImFontRtlTextNeedsShape(const char* text_begin, const char* text_end)
+{
+    const char* s = text_begin;
+    while (s < text_end)
+    {
+        unsigned int c = (unsigned int)*s;
+        if (c < 0x80)
+            s++;
+        else
+            s += ImTextCharFromUtf8(&c, s, text_end);
+        if (ImFontRtlIsArabicCodepoint(c))
+            return true;
+    }
+    return false;
+}
+
+static kbts_shape_context* ImFontRtlGetShapeContext(ImFont* font)
+{
+    if (font->RtlShapeContext != NULL)
+        return (kbts_shape_context*)font->RtlShapeContext;
+
+    kbts_shape_context* ctx = kbts_CreateShapeContext(NULL, NULL);
+    for (ImFontConfig* src : font->Sources)
+        kbts_ShapePushFontFromMemory(ctx, src->FontData, src->FontDataSize, (int)src->FontNo);
+    font->RtlShapeContext = ctx;
+    return ctx;
+}
+
+static void ImFontRtlDestroyShapeContext(ImFont* font)
+{
+    if (font->RtlShapeContext == NULL)
+        return;
+    kbts_DestroyShapeContext((kbts_shape_context*)font->RtlShapeContext);
+    font->RtlShapeContext = NULL;
+}
+
+static float ImFontRtlShapeText(ImFont* font, ImFontBaked* baked, const char* text_begin, const char* text_end, ImVector<ImFontRtlShapedGlyph>* out_glyphs)
+{
+    out_glyphs->clear();
+    kbts_shape_context* ctx = ImFontRtlGetShapeContext(font);
+
+    kbts_ShapeBegin(ctx, KBTS_DIRECTION_DONT_KNOW, KBTS_LANGUAGE_DONT_KNOW);
+    kbts_ShapeUtf8(ctx, text_begin, (int)(text_end - text_begin), KBTS_USER_ID_GENERATION_MODE_SOURCE_INDEX);
+    kbts_ShapeEnd(ctx);
+
+    ImFontConfig* src = font->Sources.Size > 0 ? font->Sources[0] : NULL;
+    if (src == NULL)
+        return 0.0f;
+
+    ImGui_ImplStbTrueType_FontSrcData* bd_font_data = (ImGui_ImplStbTrueType_FontSrcData*)src->FontLoaderData;
+    const float scale_for_layout = bd_font_data->ScaleFactor * baked->Size;
+    float total_advance = 0.0f;
+
+    kbts_run run;
+    while (kbts_ShapeRun(ctx, &run))
+    {
+        kbts_glyph* glyph = NULL;
+        while (kbts_GlyphIteratorNext(&run.Glyphs, &glyph))
+        {
+            if (glyph->Id == 0)
+                continue;
+
+            ImFontRtlShapedGlyph shaped_glyph;
+            shaped_glyph.GlyphId = (int)glyph->Id;
+            shaped_glyph.AdvanceX = (float)glyph->AdvanceX * scale_for_layout;
+            shaped_glyph.OffsetX = (float)glyph->OffsetX * scale_for_layout;
+            shaped_glyph.OffsetY = (float)glyph->OffsetY * scale_for_layout;
+            out_glyphs->push_back(shaped_glyph);
+            total_advance += shaped_glyph.AdvanceX;
+        }
+    }
+
+    return total_advance;
+}
+
+static ImFontGlyph* ImFontRtlFindOrLoadGlyph(ImFont* font, ImFontBaked* baked, int glyph_id)
+{
+    static ImGuiStorage shaped_glyph_index;
+
+    struct ImFontRtlGlyphCacheKey
+    {
+        ImGuiID BakedId;
+        int     GlyphId;
+    } key_data = { baked->BakedId, glyph_id };
+    ImGuiID cache_key = ImHashData(&key_data, sizeof(key_data));
+
+    int glyph_index = shaped_glyph_index.GetInt(cache_key, 0) - 1;
+    const unsigned int shaped_codepoint = 0x110000u + (unsigned int)glyph_id;
+    if (glyph_index >= 0 && glyph_index < baked->Glyphs.Size && baked->Glyphs[glyph_index].Codepoint == shaped_codepoint)
+        return &baked->Glyphs[glyph_index];
+
+    ImFontAtlas* atlas = font->OwnerAtlas;
+    ImFontConfig* src = font->Sources.Size > 0 ? font->Sources[0] : NULL;
+    if (src == NULL || atlas->Locked || (font->Flags & ImFontFlags_NoLoadGlyphs))
+        return NULL;
+
+    ImGui_ImplStbTrueType_FontSrcData* bd_font_data = (ImGui_ImplStbTrueType_FontSrcData*)src->FontLoaderData;
+    IM_ASSERT(bd_font_data != NULL);
+
+    int oversample_h, oversample_v;
+    ImFontAtlasBuildGetOversampleFactors(src, baked, &oversample_h, &oversample_v);
+    const float scale_for_layout = bd_font_data->ScaleFactor * baked->Size;
+    const float rasterizer_density = src->RasterizerDensity * baked->RasterizerDensity;
+    const float scale_for_raster_x = bd_font_data->ScaleFactor * baked->Size * rasterizer_density * oversample_h;
+    const float scale_for_raster_y = bd_font_data->ScaleFactor * baked->Size * rasterizer_density * oversample_v;
+
+    int x0, y0, x1, y1;
+    int advance, lsb;
+    stbtt_GetGlyphBitmapBoxSubpixel(&bd_font_data->FontInfo, glyph_id, scale_for_raster_x, scale_for_raster_y, 0, 0, &x0, &y0, &x1, &y1);
+    stbtt_GetGlyphHMetrics(&bd_font_data->FontInfo, glyph_id, &advance, &lsb);
+
+    ImFontGlyph glyph;
+    glyph.Codepoint = shaped_codepoint;
+    glyph.SourceIdx = 0;
+    glyph.AdvanceX = advance * scale_for_layout;
+
+    const bool is_visible = (x0 != x1 && y0 != y1);
+    if (is_visible)
+    {
+        const int w = (x1 - x0 + oversample_h - 1);
+        const int h = (y1 - y0 + oversample_v - 1);
+        ImFontAtlasRectId pack_id = ImFontAtlasPackAddRect(atlas, w, h);
+        if (pack_id == ImFontAtlasRectId_Invalid)
+            return NULL;
+        ImTextureRect* r = ImFontAtlasPackGetRect(atlas, pack_id);
+
+        stbtt_GetGlyphBitmapBox(&bd_font_data->FontInfo, glyph_id, scale_for_raster_x, scale_for_raster_y, &x0, &y0, &x1, &y1);
+        ImFontAtlasBuilder* builder = atlas->Builder;
+        builder->TempBuffer.resize(w * h);
+        unsigned char* bitmap_pixels = builder->TempBuffer.Data;
+        memset(bitmap_pixels, 0, w * h);
+
+        float sub_x, sub_y;
+        stbtt_MakeGlyphBitmapSubpixelPrefilter(&bd_font_data->FontInfo, bitmap_pixels, w, h, w,
+            scale_for_raster_x, scale_for_raster_y, 0, 0, oversample_h, oversample_v, &sub_x, &sub_y, glyph_id);
+
+        const float ref_size = baked->OwnerFont->Sources[0]->SizePixels;
+        const float offsets_scale = (ref_size != 0.0f) ? (baked->Size / ref_size) : 1.0f;
+        float font_off_x = ImFloor(src->GlyphOffset.x * offsets_scale + 0.5f) + sub_x;
+        float font_off_y = ImFloor(src->GlyphOffset.y * offsets_scale + 0.5f) + sub_y + IM_ROUND(baked->Ascent);
+        float recip_h = 1.0f / (oversample_h * rasterizer_density);
+        float recip_v = 1.0f / (oversample_v * rasterizer_density);
+
+        glyph.X0 = x0 * recip_h + font_off_x;
+        glyph.Y0 = y0 * recip_v + font_off_y;
+        glyph.X1 = (x0 + (int)r->w) * recip_h + font_off_x;
+        glyph.Y1 = (y0 + (int)r->h) * recip_v + font_off_y;
+        glyph.Visible = true;
+        glyph.PackId = pack_id;
+        glyph.U0 = (r->x) * atlas->TexUvScale.x;
+        glyph.V0 = (r->y) * atlas->TexUvScale.y;
+        glyph.U1 = (r->x + r->w) * atlas->TexUvScale.x;
+        glyph.V1 = (r->y + r->h) * atlas->TexUvScale.y;
+        baked->MetricsTotalSurface += r->w * r->h;
+        ImFontAtlasBakedSetFontGlyphBitmap(atlas, baked, src, &glyph, r, bitmap_pixels, ImTextureFormat_Alpha8, w);
+    }
+
+    glyph_index = baked->Glyphs.Size;
+    baked->Glyphs.push_back(glyph);
+    shaped_glyph_index.SetInt(cache_key, glyph_index + 1);
+    return &baked->Glyphs[glyph_index];
+}
+
+static ImVec2 ImFontRtlCalcTextSize(ImFont* font, ImFontBaked* baked, float size, float max_width, float wrap_width, const char* text_begin, const char* text_end, const char** out_remaining, ImDrawTextFlags flags)
+{
+    const float scale = size / baked->Size;
+    const float line_height = size;
+    const bool word_wrap_enabled = (wrap_width > 0.0f);
+    ImVector<ImFontRtlShapedGlyph> glyphs;
+    ImVec2 text_size(0.0f, 0.0f);
+
+    const char* s = text_begin;
+    while (s < text_end)
+    {
+        const char* line_begin = s;
+        const char* line_end = (const char*)ImMemchr(line_begin, '\n', text_end - line_begin);
+        if (line_end == NULL)
+            line_end = text_end;
+
+        const char* segment_end = line_end;
+        if (word_wrap_enabled)
+            segment_end = ImFontCalcWordWrapPositionEx(font, size, line_begin, line_end, wrap_width, flags);
+
+        float line_width = ImFontRtlShapeText(font, baked, line_begin, segment_end, &glyphs) * scale;
+        if (line_width >= max_width)
+        {
+            if (out_remaining != NULL)
+                *out_remaining = line_begin;
+            text_size.x = ImMax(text_size.x, max_width);
+            if (text_size.y == 0.0f)
+                text_size.y = line_height;
+            return text_size;
+        }
+
+        text_size.x = ImMax(text_size.x, line_width);
+        text_size.y += line_height;
+
+        if (segment_end < line_end)
+        {
+            s = ImTextCalcWordWrapNextLineStart(segment_end, line_end, flags);
+        }
+        else
+        {
+            s = (line_end < text_end) ? line_end + 1 : text_end;
+            if ((flags & ImDrawTextFlags_StopOnNewLine) != 0)
+                break;
+        }
+    }
+
+    if (text_size.y == 0.0f)
+        text_size.y = line_height;
+    if (out_remaining != NULL)
+        *out_remaining = s;
+    return text_size;
+}
+
+static bool ImFontRtlRenderText(ImFont* font, ImFontBaked* baked, ImDrawList* draw_list, float size, const ImVec2& pos, ImU32 col, const ImVec4& clip_rect, const char* text_begin, const char* text_end, float wrap_width, ImDrawTextFlags flags)
+{
+    const bool cpu_fine_clip = (flags & ImDrawTextFlags_CpuFineClip) != 0;
+    const float scale = size / baked->Size;
+    const float line_height = size;
+    const bool word_wrap_enabled = (wrap_width > 0.0f);
+    const ImU32 col_untinted = col | ~IM_COL32_A_MASK;
+    ImVector<ImFontRtlShapedGlyph> glyphs;
+
+    float y = pos.y;
+    const char* s = text_begin;
+    while (s < text_end)
+    {
+        const char* line_begin = s;
+        const char* line_end = (const char*)ImMemchr(line_begin, '\n', text_end - line_begin);
+        if (line_end == NULL)
+            line_end = text_end;
+
+        const char* segment_end = line_end;
+        if (word_wrap_enabled)
+            segment_end = ImFontCalcWordWrapPositionEx(font, size, line_begin, line_end, wrap_width, flags);
+
+        ImFontRtlShapeText(font, baked, line_begin, segment_end, &glyphs);
+        float x = pos.x;
+        for (const ImFontRtlShapedGlyph& shaped_glyph : glyphs)
+        {
+            ImFontGlyph* glyph = ImFontRtlFindOrLoadGlyph(font, baked, shaped_glyph.GlyphId);
+            if (glyph == NULL)
+            {
+                x += shaped_glyph.AdvanceX * scale;
+                continue;
+            }
+
+            if (glyph->Visible)
+            {
+                float x1 = x + (shaped_glyph.OffsetX + glyph->X0) * scale;
+                float x2 = x + (shaped_glyph.OffsetX + glyph->X1) * scale;
+                float y1 = y + (glyph->Y0 - shaped_glyph.OffsetY) * scale;
+                float y2 = y + (glyph->Y1 - shaped_glyph.OffsetY) * scale;
+                if (x1 <= clip_rect.z && x2 >= clip_rect.x && y1 <= clip_rect.w && y2 >= clip_rect.y)
+                {
+                    float u1 = glyph->U0;
+                    float v1 = glyph->V0;
+                    float u2 = glyph->U1;
+                    float v2 = glyph->V1;
+
+                    if (cpu_fine_clip)
+                    {
+                        if (x1 < clip_rect.x) { u1 = u1 + (1.0f - (x2 - clip_rect.x) / (x2 - x1)) * (u2 - u1); x1 = clip_rect.x; }
+                        if (y1 < clip_rect.y) { v1 = v1 + (1.0f - (y2 - clip_rect.y) / (y2 - y1)) * (v2 - v1); y1 = clip_rect.y; }
+                        if (x2 > clip_rect.z) { u2 = u1 + ((clip_rect.z - x1) / (x2 - x1)) * (u2 - u1); x2 = clip_rect.z; }
+                        if (y2 > clip_rect.w) { v2 = v1 + ((clip_rect.w - y1) / (y2 - y1)) * (v2 - v1); y2 = clip_rect.w; }
+                        if (y1 >= y2)
+                        {
+                            x += shaped_glyph.AdvanceX * scale;
+                            continue;
+                        }
+                    }
+
+                    draw_list->PrimReserve(6, 4);
+                    draw_list->PrimRectUV(ImVec2(x1, y1), ImVec2(x2, y2), ImVec2(u1, v1), ImVec2(u2, v2), glyph->Colored ? col_untinted : col);
+                }
+            }
+            x += shaped_glyph.AdvanceX * scale;
+        }
+
+        y += line_height;
+        if (segment_end < line_end)
+        {
+            s = ImTextCalcWordWrapNextLineStart(segment_end, line_end, flags);
+        }
+        else
+        {
+            s = (line_end < text_end) ? line_end + 1 : text_end;
+            if ((flags & ImDrawTextFlags_StopOnNewLine) != 0)
+                break;
+        }
+        if (y > clip_rect.w)
+            break;
+    }
+
+    return true;
+}
+
+#else
+
+static void ImFontRtlDestroyShapeContext(ImFont*) {}
+
+#endif // IMGUI_ENABLE_STB_TRUETYPE
+
+//-------------------------------------------------------------------------
 // [SECTION] ImFontAtlas: glyph ranges helpers
 //-------------------------------------------------------------------------
 // - GetGlyphRangesDefault()
@@ -5217,6 +5546,7 @@ ImFont::ImFont()
 
 ImFont::~ImFont()
 {
+    ImFontRtlDestroyShapeContext(this);
     ClearOutputData();
 }
 
@@ -5673,6 +6003,16 @@ ImVec2 ImFontCalcTextSizeEx(ImFont* font, float size, float max_width, float wra
     const float line_height = size;
     const float scale = line_height / baked->Size;
 
+#ifdef IMGUI_ENABLE_STB_TRUETYPE
+    if (ImFontRtlTextNeedsShape(text_begin, text_end_display))
+    {
+        ImVec2 text_size = ImFontRtlCalcTextSize(font, baked, size, max_width, wrap_width, text_begin, text_end_display, out_remaining, flags);
+        if (out_offset != NULL)
+            *out_offset = text_size;
+        return text_size;
+    }
+#endif
+
     ImVec2 text_size = ImVec2(0, 0);
     float line_width = 0.0f;
 
@@ -5865,6 +6205,14 @@ begin:
     }
     if (s == text_end)
         return;
+
+#ifdef IMGUI_ENABLE_STB_TRUETYPE
+    if (ImFontRtlTextNeedsShape(s, text_end))
+    {
+        ImFontRtlRenderText(this, baked, draw_list, size, ImVec2(x, y), col, clip_rect, s, text_end, wrap_width, flags);
+        return;
+    }
+#endif
 
     // Reserve vertices for remaining worse case (over-reserving is useful and easily amortized)
     const int vtx_count_max = (int)(text_end - s) * 4;
